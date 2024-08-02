@@ -1,0 +1,139 @@
+import cv2
+import numpy as np
+from collections import deque
+import matplotlib.pyplot as plt
+
+class CameraTamperingDetector:
+    def __init__(self, short_term_size=3, long_term_size=36):
+        self.short_term_pool = deque(maxlen=short_term_size)
+        self.long_term_pool = deque(maxlen=long_term_size)
+        self.frame_count = 0
+
+    def compute_chromaticity_histogram(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        return cv2.normalize(hist, hist).flatten()
+
+    def compute_L1R_histogram(self, frame):
+        L1_norm = np.sum(frame, axis=2).astype(np.float32)
+        R = (np.amax(frame, axis=2) - np.amin(frame, axis=2)).astype(np.float32)
+        stacked = np.stack((L1_norm, R), axis=-1)
+        hist = cv2.calcHist([stacked], [0, 1], None, [8, 8], [0, 256, 0, 256])
+        return cv2.normalize(hist, hist).flatten()
+
+    def compute_gradient_histogram(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        grad_dir = np.arctan2(grad_y, grad_x).astype(np.float32)
+        hist = cv2.calcHist([grad_dir], [0], None, [16], [-np.pi, np.pi])
+        return cv2.normalize(hist, hist).flatten()
+
+    def compute_histogram(self, frame):
+        hist_chromaticity = self.compute_chromaticity_histogram(frame)
+        hist_L1R = self.compute_L1R_histogram(frame)
+        hist_gradient = self.compute_gradient_histogram(frame)
+        return np.concatenate((hist_chromaticity, hist_L1R, hist_gradient))
+
+    def compute_dissimilarity(self, hist1, hist2):
+        return np.sum(np.abs(hist1 - hist2))
+
+    def compute_dissimilarity_vectorized(self, pool1, pool2):
+        pool1 = np.array(pool1)
+        pool2 = np.array(pool2)
+        diffs = np.abs(pool1[:, np.newaxis, :] - pool2[np.newaxis, :, :])
+        return np.sum(diffs, axis=2).flatten()
+
+    def detect_tampering(self, frame):
+        self.frame_count += 1
+        hist = self.compute_histogram(frame)
+        
+        self.short_term_pool.append(hist)
+        if len(self.short_term_pool) == self.short_term_pool.maxlen:
+            self.long_term_pool.append(self.short_term_pool[0])
+
+        if len(self.long_term_pool) < self.long_term_pool.maxlen:
+            return False, 0.0
+
+        short_term_diffs = self.compute_dissimilarity_vectorized(self.short_term_pool, self.long_term_pool)
+        long_term_diffs = self.compute_dissimilarity_vectorized(self.long_term_pool, self.long_term_pool)
+
+        d_between = np.median(short_term_diffs)
+        d_long = np.median(long_term_diffs)
+
+        d_norm = np.log(d_between / d_long)
+
+        threshold = 1
+        print(d_norm)
+        return d_norm > threshold, d_norm
+
+def process_video(input_video_path, output_video_path):
+    cap = cv2.VideoCapture(input_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'XVID'), 3, (frame_width + 300, frame_height))
+
+    short_term_size = int(3 * 5)
+    long_term_size = int(3 * 60)
+
+    print(f"short_term_size: {short_term_size}, long_term_size: {long_term_size}")
+
+    detector = CameraTamperingDetector(short_term_size=short_term_size, long_term_size=long_term_size)
+
+    d_norm_values = []
+
+    frame_interval = int(fps / 3)
+
+    while True:
+        for _ in range(frame_interval):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+        if not ret:
+            break
+
+        tampering_detected, d_norm = detector.detect_tampering(frame)
+        d_norm_values.append(d_norm)
+
+        if detector.frame_count >= detector.long_term_pool.maxlen:
+            if tampering_detected:
+                cv2.putText(frame, "TAMPERING DETECTED", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        else:
+            cv2.putText(frame, f"Initializing... {detector.frame_count}/{detector.long_term_pool.maxlen}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        fig, ax = plt.subplots(figsize=(3, 6))
+        ax.plot(d_norm_values[-100:], range(len(d_norm_values[-100:])))
+        ax.set_xlim(0, 2)
+        ax.set_ylim(0, 100)
+        ax.set_xlabel('d_norm')
+        ax.set_ylabel('Frame')
+        ax.set_title('Dissimilarity')
+
+        plt.tight_layout()
+        fig.canvas.draw()
+        plot_img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        plt.close(fig)
+
+        plot_img = cv2.resize(plot_img, (300, frame_height))
+
+        combined_frame = np.hstack((frame, plot_img[:, :, :3]))
+
+        out.write(combined_frame)
+        cv2.imshow('Combined Feed', combined_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    input_video_path = 'home_test_temparing.mp4'  # Đường dẫn đến video đầu vào
+    output_video_path = 'output_home_test_temparing.avi'  # Đường dẫn để lưu video đầu ra
+    process_video(input_video_path, output_video_path)
